@@ -163,16 +163,14 @@ small_json_docs = json_values(
 
 def safe_json_values(scalars, keys):
     """ Documents that avoid the inputs on which make_patch is currently known
-    to fail (see test_roundtrip): booleans and object keys that are '-' """
-    return json_values(
-        scalars.filter(lambda value: not isinstance(value, bool)),
-        keys.filter(lambda key: key != '-'),
-    )
+    to fail (see test_roundtrip): object keys that are '-' """
+    return json_values(scalars, keys.filter(lambda key: key != '-'))
 
 
 safe_json_docs = safe_json_values(json_scalars, json_keys)
-small_safe_json_docs = safe_json_values(st.sampled_from([None, 0, 1, 'a']),
-                                        st.sampled_from(['a', 'b', '0', '1']))
+small_safe_json_docs = safe_json_values(
+    st.sampled_from([None, True, False, 0, 1, 'a']),
+    st.sampled_from(['a', 'b', '0', '1']))
 
 
 def pairs_of(*doc_strategies):
@@ -286,16 +284,16 @@ class MakePatchProperties(unittest.TestCase):
         self.assertEqual(list(jsonpatch.make_patch(doc, copy.deepcopy(doc))),
                          [])
 
-    @unittest.expectedFailure
     @given(doc_pairs)
-    # move detection considers e.g. [1] and [true] equal, #180
-    @example(docs=({'a': [1]}, {'b': [True]}))
-    # replace of the object member '-' is rejected
+    # replace of the object member '-' was rejected, #212
     @example(docs=({'-': 0}, {'-': 1}))
     def test_roundtrip(self, docs):
         self.check_roundtrip(*docs)
 
     @given(safe_doc_pairs)
+    # the diff considered e.g. 1 and true equal, #180
+    @example(docs=([0], [False]))
+    @example(docs=({'a': [1]}, {'b': [True]}))
     def test_roundtrip_of_safe_documents(self, docs):
         self.check_roundtrip(*docs)
 
@@ -334,13 +332,10 @@ class ApplyPatchProperties(unittest.TestCase):
         outcome(jsonpatch.apply_patch, doc, patch)
         assert_json_equal(patch, saved)
 
-    @unittest.expectedFailure
     @given(docs_with_patches())
-    # 'move' from the whole document crashes for array roots
+    # 'move' from the whole document crashed for array roots, #214
     @example(case=([], [{'op': 'move', 'from': '', 'path': '/-'}]))
-    # 'copy' or 'move' from the '-' of an array crashes
-    @example(case=([0], [{'op': 'copy', 'from': '/-', 'path': '/0'}]))
-    # operations on the whole document crash if it is a scalar
+    # operations on the whole document crashed if it was a scalar, #213
     @example(case=(None, [{'op': 'remove', 'path': ''}]))
     def test_raises_only_documented_exceptions(self, case):
         doc, patch = case
@@ -349,7 +344,6 @@ class ApplyPatchProperties(unittest.TestCase):
         except (jsonpatch.JsonPatchException, JsonPointerException):
             pass
 
-    @unittest.expectedFailure
     @given(st.lists(st.one_of(
         json_docs,
         st.dictionaries(st.sampled_from(['op', 'path', 'from', 'value']),
@@ -359,9 +353,9 @@ class ApplyPatchProperties(unittest.TestCase):
             optional={'path': json_docs, 'from': json_docs,
                       'value': json_docs}),
     )))
-    # patch elements that are not objects
+    # patch elements that are not objects raised TypeError, #215
     @example(patch=[0])
-    # 'from' that is not a string
+    # 'from' that is not a string raised TypeError, #215
     @example(patch=[{'op': 'copy', 'from': 0, 'path': '/a'}])
     def test_malformed_patch_raises_documented_exceptions(self, patch):
         try:
@@ -387,9 +381,8 @@ class ApplyPatchProperties(unittest.TestCase):
 
 class OperationProperties(unittest.TestCase):
 
-    @unittest.expectedFailure
     @given(whole_document_operations())
-    # 'add' crashes if the document is a scalar, unlike 'replace'
+    # 'add' crashed if the document was a scalar, unlike 'replace', #213
     @example(case=(None, {'op': 'add', 'path': '', 'value': 0}, 0))
     def test_whole_document_as_target(self, case):
         doc, operation, expected = case
@@ -407,8 +400,7 @@ class OperationProperties(unittest.TestCase):
         assert_json_equal(result, expected)
 
     # RFC 6902, 4.4: a location cannot be moved into one of its children;
-    # only enforced if the location is an object member
-    @unittest.expectedFailure
+    # was only enforced if the location is an object member, #214
     @given(moves_into_own_child())
     @example(case=([[], []], '/0', '/0/0'))
     def test_move_into_own_child_fails(self, case):
@@ -418,9 +410,8 @@ class OperationProperties(unittest.TestCase):
             jsonpatch.apply_patch(
                 doc, [{'op': 'move', 'from': source, 'path': target}])
 
-    # '-' is rejected even where it is an object key, not an array index
-    @unittest.expectedFailure
     @given(docs_with_locations(), json_docs)
+    # '-' was rejected even where it is an object key, not an array index, #212
     @example(case=({'-': None}, ['-']), value=0)
     def test_replace_any_existing_location(self, case, value):
         doc, parts = case
@@ -428,11 +419,13 @@ class OperationProperties(unittest.TestCase):
             doc, [{'op': 'replace', 'path': to_pointer(parts), 'value': value}])
         assert_json_equal(resolve(result, parts), value)
 
-    # RFC 6902, 4.6: literals like true are only equal to themselves, but
-    # 'test' uses Python equality, which considers 1 and True equal
-    @unittest.expectedFailure
+    # RFC 6902, 4.6: literals like true are only equal to themselves, although
+    # Python considers 1 and True equal, #216
     @given(doc_pairs)
     @example(values=(1, True))
+    @example(values=([1], [True]))
+    @example(values=({'a': 0}, {'a': False}))
+    @example(values=(1, 1.0))
     def test_test_operation_uses_json_equality(self, values):
         value, tested = values
         result = outcome(jsonpatch.apply_patch, {'a': value},
@@ -451,8 +444,6 @@ class JsonPatchProperties(unittest.TestCase):
         self.assertEqual(jsonpatch.JsonPatch.from_string(patch.to_string()),
                          patch)
 
-    # hashing fails for operations whose value is an array or object
-    @unittest.expectedFailure
     @given(patches)
     @example(operations=[{'op': 'add', 'path': '/a', 'value': []}])
     def test_equal_patches_have_equal_hashes(self, operations):
